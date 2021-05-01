@@ -1,0 +1,14 @@
+    # PS2 KBD --------------------------------------------------------------------------------------
+
+    if "ps2kbd" in d["csr_bases"]:
+        dts += """
+            ps2kbd0: ps2kbd@{ps2kbd_csr_base:x} {{
+                compatible = "litex,ps2-1.0";
+                reg = <0x{ps2kbd_csr_base:x} 0x18>;
+                {ps2kbd_interrupt}
+                status = "okay";
+            }};
+""".format(
+    ps2kbd_csr_base  = d["csr_bases"]["ps2kbd"],
+    ps2kbd_interrupt = "" if polling else "interrupts = <{}>;".format(d["constants"]["ps2kbd_interrupt"]))
+

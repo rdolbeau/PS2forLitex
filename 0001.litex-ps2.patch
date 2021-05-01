@@ -1,0 +1,262 @@
+diff --git a/drivers/input/serio/Kconfig b/drivers/input/serio/Kconfig
+index f39b7b3f7942..c48a34bf5480 100644
+--- a/drivers/input/serio/Kconfig
++++ b/drivers/input/serio/Kconfig
+@@ -304,6 +304,15 @@ config SERIO_GPIO_PS2
+ 
+ 	  If you are unsure, say N.
+ 
++config SERIO_LITEX_PS2
++	tristate "LiteX PS/2 controller"
++	depends on HAS_IOMEM
++	help
++	  Say Y here if you have LiteX PS/2 ports.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called litex_ps2.
++
+ config USERIO
+ 	tristate "User space serio port driver support"
+ 	help
+diff --git a/drivers/input/serio/Makefile b/drivers/input/serio/Makefile
+index 6d97bad7b844..3613768f1d9b 100644
+--- a/drivers/input/serio/Makefile
++++ b/drivers/input/serio/Makefile
+@@ -32,4 +32,5 @@ obj-$(CONFIG_SERIO_OLPC_APSP)	+= olpc_apsp.o
+ obj-$(CONFIG_HYPERV_KEYBOARD)	+= hyperv-keyboard.o
+ obj-$(CONFIG_SERIO_SUN4I_PS2)	+= sun4i-ps2.o
+ obj-$(CONFIG_SERIO_GPIO_PS2)	+= ps2-gpio.o
++obj-$(CONFIG_SERIO_LITEX_PS2)	+= litex_ps2.o
+ obj-$(CONFIG_USERIO)		+= userio.o
+diff --git a/drivers/input/serio/litex_ps2.c b/drivers/input/serio/litex_ps2.c
+new file mode 100644
+index 000000000000..45315f27d50f
+--- /dev/null
++++ b/drivers/input/serio/litex_ps2.c
+@@ -0,0 +1,226 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * LiteX PS2 controller driver
++ *
++ * Copyright (C) 2021 Romain Dolbeau <romain@dolbeau.org>
++ *
++ * Based on altera_ps2.c which is
++ * Copyright (C) 2008 Thomas Chou <thomas@wytron.com.tw>
++ *
++ * Based on sa1111ps2.c, which is:
++ * Copyright (C) 2002 Russell King
++ */
++
++#include <linux/module.h>
++#include <linux/input.h>
++#include <linux/serio.h>
++#include <linux/interrupt.h>
++#include <linux/platform_device.h>
++#include <linux/io.h>
++#include <linux/slab.h>
++#include <linux/of.h>
++
++#define DRV_NAME "litex_ps2"
++
++#include <linux/litex.h>
++
++struct ps2if {
++	struct serio *io;
++	void __iomem *base;
++	struct platform_device *pdev;
++};
++
++#define PS2IF_RX_DATA (ps2if->base + 0)
++#define PS2IF_TX_DATA (ps2if->base + 4)
++#define PS2IF_CTRL    (ps2if->base + 8)
++
++#define PS2IF_EV_STATUS (ps2if->base + 12)
++#define PS2IF_EV_PENDING (ps2if->base + 16)
++#define PS2IF_EV_ENABLE (ps2if->base + 20)
++
++#define PS2IF_CTRL_IRQENABLE 0x00000001
++#define PS2IF_CTRL_HWENABLE  0x00000002
++#define PS2IF_CTRL_DEF (PS2IF_CTRL_IRQENABLE | PS2IF_CTRL_HWENABLE)
++
++/*
++ * Read a byte from the PS2 port
++ */
++static irqreturn_t litex_ps2_rxint(int irq, void *dev_id)
++{
++	struct ps2if *ps2if = dev_id;
++	unsigned int status;
++	irqreturn_t handled = IRQ_NONE;
++	int reg;
++	status = litex_read32(PS2IF_EV_STATUS);
++	if (status) {
++		status = litex_read32(PS2IF_RX_DATA);
++		if (!(status & 0x80000000)) {
++			dev_info(&ps2if->pdev->dev, " rxint: interrupt but not data ?!?\n");
++			handled = IRQ_HANDLED;
++		} else {
++			litex_write32(PS2IF_CTRL, PS2IF_CTRL_DEF); // ack, keep irq enabled
++			serio_interrupt(ps2if->io, status & 0xff, 0);
++/* 			dev_info(&ps2if->pdev->dev, " rxint: handling 0x%08x\n", status); */
++			handled = IRQ_HANDLED;
++		}
++	} else {
++		handled = IRQ_HANDLED;
++	}
++	// clear IRQ
++	reg = litex_read32(PS2IF_EV_PENDING);
++	litex_write32(PS2IF_EV_PENDING, reg);
++
++	return handled;
++}
++
++/*
++ * Write a byte to the PS2 port.
++ */
++static int litex_ps2_write(struct serio *io, unsigned char val)
++{
++	struct ps2if *ps2if = io->port_data;
++	unsigned int status;
++	int count = 0;
++
++	while (((status = litex_read32(PS2IF_TX_DATA)) & 0x80000000) && count < 10)
++		count++;
++
++	if (status) dev_info(&ps2if->pdev->dev, " write: still seeing 0x%08x\n", status);
++
++	litex_write32(PS2IF_TX_DATA, (0x80000000 | val));
++
++/* 	dev_info(&ps2if->pdev->dev, " write: wrote 0x%08x", (0x80000000 | val)); */
++
++	return 0;
++}
++
++static int litex_ps2_open(struct serio *io)
++{
++	struct ps2if *ps2if = io->port_data;
++	unsigned int status;
++	int count = 0;
++	int reg;
++
++	/* clear fifo */
++	while (((status = litex_read32(PS2IF_RX_DATA)) & 0xFFFFFFFF) && count < 16) {
++		litex_write32(PS2IF_CTRL, PS2IF_CTRL_DEF); /* enable / ack */
++		dev_info(&ps2if->pdev->dev, " open: ignoring 0x%08x", status);
++		count ++;
++	}
++	if (status) dev_info(&ps2if->pdev->dev, " open: still seeing 0x%08x\n", status);
++
++	// clear pending IRQ
++	reg = litex_read32(PS2IF_EV_PENDING);
++	litex_write32(PS2IF_EV_PENDING, reg);
++	// enable IRQ
++	litex_write32(PS2IF_EV_ENABLE, 1);
++	
++/* 	dev_info(&ps2if->pdev->dev, " open: opened\n"); */
++
++	return 0;
++}
++
++static void litex_ps2_close(struct serio *io)
++{
++	struct ps2if *ps2if = io->port_data;
++	int reg;
++
++	litex_write32(PS2IF_CTRL, PS2IF_CTRL_DEF); /* don'( disable anything for now */
++
++	// disable IRQ
++	litex_write32(PS2IF_EV_ENABLE, 0);
++	// clear pending IRQ
++	reg = litex_read32(PS2IF_EV_PENDING);
++	litex_write32(PS2IF_EV_PENDING, reg);
++}
++
++/*
++ * Add one device to this driver.
++ */
++static int litex_ps2_probe(struct platform_device *pdev)
++{
++	struct ps2if *ps2if;
++	struct resource *res;
++	struct serio *serio;
++	int error, irq;
++
++	ps2if = devm_kzalloc(&pdev->dev, sizeof(struct ps2if), GFP_KERNEL);
++	if (!ps2if)
++		return -ENOMEM;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	ps2if->base = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(ps2if->base))
++		return PTR_ERR(ps2if->base);
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return -ENXIO;
++
++	error = devm_request_irq(&pdev->dev, irq, litex_ps2_rxint, 0,
++				 pdev->name, ps2if);
++	if (error) {
++		dev_err(&pdev->dev, "could not request IRQ %d\n", irq);
++		return error;
++	}
++
++	serio = kzalloc(sizeof(struct serio), GFP_KERNEL);
++	if (!serio)
++		return -ENOMEM;
++
++	serio->id.type		= SERIO_8042;
++	serio->write		= litex_ps2_write;
++	serio->open		= litex_ps2_open;
++	serio->close		= litex_ps2_close;
++	strlcpy(serio->name, dev_name(&pdev->dev), sizeof(serio->name));
++	strlcpy(serio->phys, dev_name(&pdev->dev), sizeof(serio->phys));
++	serio->port_data	= ps2if;
++	serio->dev.parent	= &pdev->dev;
++	ps2if->io		= serio;
++
++	dev_info(&pdev->dev, "base %p, irq %d\n", ps2if->base, irq);
++
++	serio_register_port(ps2if->io);
++	ps2if->pdev = pdev;
++	platform_set_drvdata(pdev, ps2if);
++
++	return 0;
++}
++
++/*
++ * Remove one device from this driver.
++ */
++static int litex_ps2_remove(struct platform_device *pdev)
++{
++	struct ps2if *ps2if = platform_get_drvdata(pdev);
++
++	serio_unregister_port(ps2if->io);
++
++	return 0;
++}
++
++#ifdef CONFIG_OF
++static const struct of_device_id litex_ps2_match[] = {
++	{ .compatible = "litex,ps2-1.0", },
++	{},
++};
++MODULE_DEVICE_TABLE(of, litex_ps2_match);
++#endif /* CONFIG_OF */
++
++/*
++ * Our device driver structure
++ */
++static struct platform_driver litex_ps2_driver = {
++	.probe		= litex_ps2_probe,
++	.remove		= litex_ps2_remove,
++	.driver	= {
++		.name	= DRV_NAME,
++		.of_match_table = of_match_ptr(litex_ps2_match),
++	},
++};
++module_platform_driver(litex_ps2_driver);
++
++MODULE_DESCRIPTION("LiteX PS2 controller driver");
++MODULE_AUTHOR("Romain Dolbeau <romain@dolbeau.org>");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:" DRV_NAME);
