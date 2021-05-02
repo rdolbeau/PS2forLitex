@@ -58,24 +58,24 @@ class PS2HostClkCtrl(Module):
                             self.ps2_clk_o.eq(0))
 
 class PS2HostWatchdog(Module):
-    def __init__(self, sys_clk, sys_clk_freq, sys_rst, ps2_clk_posedge, ps2_clk_negedge):
+    def __init__(self, sys_clk, sys_clk_freq, sys_rst, ps2_clk_posedge, ps2_clk_negedge, watchdog_delay_us = 200):
         self.watchdog_rst = Signal()
         watchdog_active = Signal()
         
-        cycles_for_200us = int(200e-6 * sys_clk_freq)
-        watchdog_timer = Signal(log2_int(cycles_for_200us, need_pow2 = False))
+        cycles_for_Xus = int(watchdog_delay_us * 1e-6 * sys_clk_freq)
+        watchdog_timer = Signal(log2_int(cycles_for_Xus, need_pow2 = False))
         ps2_clk_edge = Signal()
         
         self.comb += ps2_clk_edge.eq(ps2_clk_posedge | ps2_clk_negedge)
         self.sync += If((sys_rst | self.watchdog_rst | ~(watchdog_active | ps2_clk_edge)),
-                        watchdog_active.eq(1)).Else(
-                            watchdog_active.eq(0))
+                        watchdog_active.eq(0)).Else(
+                            watchdog_active.eq(1))
         self.sync += If((sys_rst | self.watchdog_rst | ~watchdog_active | ps2_clk_edge),
-                        watchdog_timer.eq(cycles_for_200us)).Else(
+                        watchdog_timer.eq(cycles_for_Xus)).Else(
                             watchdog_timer.eq(watchdog_timer - 1))
         self.comb += If(watchdog_timer == 0,
                         self.watchdog_rst.eq(1)).Else(
-                            self.watchdog_rst.eq(0)) 
+                            self.watchdog_rst.eq(0))
 
 class PS2HostRX(Module):
     def __init__(self, sys_clk, sys_clk_freq, sys_rst, ps2_clk_negedge, ps2_data):
@@ -140,14 +140,17 @@ class PS2Host(Module):
         ps2_clk_oe = Signal()
         self.specials += Tristate(ps2_clk, ps2_clk_o, ps2_clk_oe, ps2_clk_i)
         self.busy = Signal()
-        
+
+        # Clock tracking
         self.submodules.clk_ctrl = PS2HostClkCtrl(sys_clk, sys_clk_freq, sys_rst, ps2_clk_i, send_req)
         self.ps2_clk_posedge = self.clk_ctrl.ps2_clk_posedge
         self.ps2_clk_negedge = self.clk_ctrl.ps2_clk_negedge
 
-        self.submodules.watchdog = PS2HostWatchdog(sys_clk, sys_clk_freq, sys_rst, self.ps2_clk_posedge, self.ps2_clk_negedge)
+        # Watchdog
+        self.submodules.watchdog = PS2HostWatchdog(sys_clk, sys_clk_freq, sys_rst, self.ps2_clk_posedge, self.ps2_clk_negedge, watchdog_delay_us = 400)
         self.watchdog_rst = self.watchdog.watchdog_rst
 
+        # RX data
         rx_rst = Signal()
         self.comb += rx_rst.eq(sys_rst | self.busy | self.watchdog_rst)
         self.submodules.rx = PS2HostRX(sys_clk, sys_clk_freq, rx_rst, self.ps2_clk_negedge, ps2_data_i)
@@ -155,6 +158,7 @@ class PS2Host(Module):
         self.ready = self.rx.ready
         self.error = self.rx.error
 
+        # TX Data
         tx_rst = Signal()
         self.comb += tx_rst.eq(sys_rst | self.watchdog_rst)
         self.submodules.tx = PS2HostTX(sys_clk, sys_clk_freq, tx_rst, self.ps2_clk_posedge, tx_data, send_req)
